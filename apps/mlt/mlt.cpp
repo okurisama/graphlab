@@ -27,39 +27,39 @@ typedef std::vector<graphlab::vertex_id_type> id_vector_type;
 id_vector_type SEEDS;
 
 // The vertex data is a personalized-pagerank value per specified vertex
-typedef float pagerank_t;
-typedef ublas::vector<pagerank_t> vertex_data_type; // use pagerank_t to save space in storage
-typedef ublas::vector<double> gather_type; // always use double to preserve precision during computation
+typedef float storage_scalar_type; // use float to save space in storage
+typedef ublas::vector<storage_scalar_type> storage_vector_type;
+const double REL_TOLERANCE = 1e-6; // appx rel precision of float
 
-vertex_data_type N_VERTICES;
+typedef double gather_scalar_type; // use double to preserve precision during summation
+typedef ublas::vector<gather_scalar_type> gather_vector_type;
 
-// The edge weight is the edge data
-// note that the OUT_EDGES of a vertex should sum-to-one!
-typedef double edge_data_type;
+gather_vector_type N_VERTICES;
+
 
 // The graph type is determined by the vertex and edge data types
-typedef graphlab::distributed_graph<vertex_data_type, edge_data_type> graph_type;
+typedef graphlab::distributed_graph<storage_vector_type, storage_scalar_type> graph_type;
 
 void init_uniform_weights(graph_type::edge_type& edge) {
-    edge.data() = 1.f/edge.source().num_out_edges();
+    edge.data() = 1.0/edge.source().num_out_edges();
 }
 
 void length_norm(graph_type::edge_type& edge) {
     // cf. T11106.  Assumes edge weights are normalized to be in [0,1] before application
-    const double n = edge.target().num_in_edges();
+    const gather_scalar_type n = edge.target().num_in_edges();
     edge.data() *= 10. / (1. + std::exp(4.-n)) / std::sqrt(std::max(100., n));
 }
 
 void one_vertex(graph_type::vertex_type& vertex) {
-    vertex.data() = ublas::scalar_vector<pagerank_t>(std::max(1ul, SEEDS.size()));
+    vertex.data() = ublas::scalar_vector<storage_scalar_type>(std::max(1ul, SEEDS.size()));
 }
 void zero_vertex(graph_type::vertex_type& vertex) {
-    vertex.data() = ublas::zero_vector<pagerank_t>(std::max(1ul, SEEDS.size()));
+    vertex.data() = ublas::zero_vector<storage_scalar_type>(std::max(1ul, SEEDS.size()));
 }
 
-class normalize_edges : public graphlab::ivertex_program<graph_type, double>
+class normalize_edges : public graphlab::ivertex_program<graph_type, gather_scalar_type>
 {
-    double total_;
+    gather_scalar_type total_;
 public:
     normalize_edges() : total_(0) {}
     edge_dir_type gather_edges(icontext_type& context,
@@ -67,18 +67,16 @@ public:
         return graphlab::OUT_EDGES;
     }
     /* Add up the weight on out edges */
-    double gather(icontext_type& context, const vertex_type& vertex,
+    gather_scalar_type gather(icontext_type& context, const vertex_type& vertex,
             edge_type& edge) const {
         return edge.data();
     }
     /* record the sum */
-    void apply(icontext_type& context, vertex_type& vertex,
-                const gather_type& total) {
+    void apply(icontext_type& context, vertex_type& vertex, const gather_scalar_type& total) {
         total_ = total;
     }
-    edge_dir_type scatter_edges(icontext_type& context,
-            const vertex_type& vertex) const {
-        return graphlab::OUT_EDGES;
+    edge_dir_type scatter_edges(icontext_type& context, const vertex_type& vertex) const {
+        return total_ ? graphlab::OUT_EDGES : graphlab::NO_EDGES;
     }
     /* Normalize edge weights */
     void scatter(icontext_type& context, const vertex_type& vertex, edge_type& edge) const {
@@ -93,24 +91,20 @@ public:
 };
 
 // initially 1 for vertices that are reachable from a seed; 0 otherwise
-class init_pageranks : public graphlab::ivertex_program<graph_type, vertex_data_type>
+class init_pageranks : public graphlab::ivertex_program<graph_type, storage_vector_type>
 {
     bool changed;
 public:
     init_pageranks() : changed(false) {}
-
-    edge_dir_type gather_edges(icontext_type& context,
-            const vertex_type& vertex) const {
+    edge_dir_type gather_edges(icontext_type& context, const vertex_type& vertex) const {
         return graphlab::IN_EDGES;
     }
-    vertex_data_type gather(icontext_type& context, const vertex_type& vertex,
-            edge_type& edge) const {
+    storage_vector_type gather(icontext_type& context, const vertex_type& vertex, edge_type& edge) const {
         return edge.source().data();
     }
-    void apply(icontext_type& context, vertex_type& vertex,
-                const gather_type& total) {
-        const vertex_data_type before = vertex.data();
-        vertex_data_type& after = vertex.data();
+    void apply(icontext_type& context, vertex_type& vertex, const storage_vector_type& total) {
+        storage_vector_type& before = vertex.data();
+        storage_vector_type after = vertex.data();
         for (size_t i=0; i<total.size(); ++i) {
             after[i] = total[i] ? 1. : after[i];
         }
@@ -118,29 +112,16 @@ public:
         if (pos != SEEDS.end() && *pos == vertex.id()) {
             after[std::distance(SEEDS.begin(), pos)] = 1;
         }
-        changed = ublas::norm_inf(after-before);
-        if (context.iteration() > 1000 && changed) {
-            std::stringstream ss;
-            ss << "unconverged:" << vertex.id() << std::endl;
-            ss << "\tbefore:\t[ ";
-            for (size_t i=0; i<before.size(); ++i) {
-                ss << before[i] << " ";
+        changed = false;
+        for (size_t i=0; i<before.size(); ++i) {
+            if (before[i] != after[i]) {
+                changed = true;
+                std::swap(before, after);
+                break;
             }
-            ss << "]" << std::endl << "\tafter:\t[ ";
-            for (size_t i=0; i<after.size(); ++i) {
-                ss << after[i] << " ";
-            }
-            vertex_data_type delta = after-before;
-            ss << "]" << std::endl << "\tdelta:\t[ ";
-            for (size_t i=0; i<delta.size(); ++i) {
-                ss << delta[i] << " ";
-            }
-            ss << "]" << std::endl;
-            std::cerr << ss.str();
         }
     }
-    edge_dir_type scatter_edges(icontext_type& context,
-            const vertex_type& vertex) const {
+    edge_dir_type scatter_edges(icontext_type& context, const vertex_type& vertex) const {
         return changed ? graphlab::OUT_EDGES : graphlab::NO_EDGES;
     }
     void scatter(icontext_type& context, const vertex_type& vertex, edge_type& edge) const {
@@ -155,39 +136,23 @@ public:
 };
 
 // MLT is really just weighted personalized pagerank
-class mlt : public graphlab::ivertex_program<graph_type, vertex_data_type>
+class mlt : public graphlab::ivertex_program<graph_type, gather_vector_type>
 {
     bool converged;
 public:
-
     mlt() : converged(false) {}
-
-    /**
-     * Gather only in edges.
-     */
     edge_dir_type gather_edges(icontext_type& context,
             const vertex_type& vertex) const {
         return graphlab::IN_EDGES;
-    } // end of Gather edges
-
-
-    /* Gather the weighted rank of the adjacent page   */
-    gather_type gather(icontext_type& context, const vertex_type& vertex,
-            edge_type& edge) const {
+    }
+    gather_vector_type gather(icontext_type& context, const vertex_type& vertex, edge_type& edge) const {
         return edge.source().data() * edge.data();
     }
-
-    /* Use the total rank of adjacent pages to update this page */
-    void apply(icontext_type& context, vertex_type& vertex,
-            const gather_type& total) {
-        vertex_data_type oldval = vertex.data();
-        vertex_data_type& newval = vertex.data();
-        if (total.empty()) {
-            // no in vertices
-            ublas::noalias(newval) = ublas::zero_vector<pagerank_t>(std::max(1ul, SEEDS.size()));
-        } else {
-            ublas::noalias(newval) = (1.0 - RESET_PROB) * total;
-        }
+    void apply(icontext_type& context, vertex_type& vertex, const gather_vector_type& total) {
+        storage_vector_type& oldval = vertex.data();
+        storage_vector_type newval = total.empty()
+                                     ? storage_vector_type(ublas::zero_vector<storage_scalar_type>(std::max(1ul, SEEDS.size())))
+                                     : total * (1.0 - RESET_PROB);
         if (SEEDS.empty()) {
             // non-personalized; so everyone gets some rank from teleportation
             newval[0] += RESET_PROB;
@@ -200,23 +165,24 @@ public:
                 newval[i] += RESET_PROB*N_VERTICES[i];
             }
         }
-        double last_change = std::fabs(ublas::norm_inf(newval - oldval));
-        converged = (last_change <= TOLERANCE);
-//        std::swap(vertex.data(), newval);
+        converged = true;
+        for (size_t i=0; i<newval.size(); ++i) {
+            double delta = std::fabs(newval[i]-oldval[i]);
+            if (delta > TOLERANCE && delta/newval[i] > REL_TOLERANCE) {
+                converged = false;
+                break;
+            }
+        }
+        std::swap(oldval, newval);
         if (ITERATIONS) context.signal(vertex);
     }
-
-    edge_dir_type scatter_edges(icontext_type& context,
-            const vertex_type& vertex) const {
+    edge_dir_type scatter_edges(icontext_type& context, const vertex_type& vertex) const {
         if (ITERATIONS) return graphlab::NO_EDGES;
         return converged ? graphlab::NO_EDGES : graphlab::OUT_EDGES;
     }
-
-    void scatter(icontext_type& context, const vertex_type& vertex,
-            edge_type& edge) const {
+    void scatter(icontext_type& context, const vertex_type& vertex, edge_type& edge) const {
         context.signal(edge.target());
     }
-
     void save(graphlab::oarchive& oarc) const {
         if (ITERATIONS == 0) oarc << converged;
     }
@@ -245,11 +211,10 @@ struct mlt_writer
 }; // end of pagerank writer
 
 
-bool wtsv_parser(graph_type& graph, const std::string& srcfilename,
-        const std::string& str) {
+bool wtsv_parser(graph_type& graph, const std::string& srcfilename, const std::string& str) {
     if (str.empty()) return true;
     size_t source=-1, target=-1;
-    edge_data_type weight=0;
+    gather_scalar_type weight=0;
     char* targetptr;
     source = strtoul(str.c_str(), &targetptr, 10);
     if (targetptr == NULL) return false;
@@ -260,42 +225,49 @@ bool wtsv_parser(graph_type& graph, const std::string& srcfilename,
     return true;
 }
 
-typedef std::pair<graphlab::vertex_id_type, double> heap_entry_type;
+typedef std::pair<graphlab::vertex_id_type, storage_scalar_type> heap_entry_type;
 typedef std::vector<heap_entry_type> heap_type;
-struct MergeableHeaps : std::vector<heap_type> {
+
+struct MergeableHeaps : std::pair<std::vector<heap_type>,std::vector<heap_type> > // first deviations; second collections
+{
 private:
     static bool cmp(const heap_entry_type& a, const heap_entry_type& b) {
         return a.second>b.second || (a.second==b.second && a.first>b.first);
     }
 public:
-    void operator+=(const MergeableHeaps& other) {
-        for (size_t i=0; i<other.size(); ++i) {
-            heap_type& heap = at(i);
-            const heap_type& h2 = other[i];
-            heap.reserve(heap.size()+other.size());
-            std::copy(h2.begin(), h2.end(), std::back_inserter(heap));
-            if (heap.size() > TOP_K) {
-                std::nth_element(heap.begin(), heap.begin()+TOP_K, heap.end(), cmp);
-                heap.resize(TOP_K);
+    void operator+=(const MergeableHeaps& other_pair) {
+        for (size_t heapidx=0; heapidx<2; ++heapidx) {
+            std::vector<heap_type>& me = heapidx ? second : first;
+            const std::vector<heap_type>& other = heapidx ? other_pair.second : other_pair.first;
+            for (size_t i=0; i<other.size(); ++i) {
+                heap_type& heap = me[i];
+                const heap_type& h2 = other[i];
+                heap.reserve(heap.size()+other.size());
+                std::copy(h2.begin(), h2.end(), std::back_inserter(heap));
+                if (heap.size() > TOP_K) {
+                    std::nth_element(heap.begin(), heap.begin()+TOP_K, heap.end(), cmp);
+                    heap.resize(TOP_K);
+                }
+                std::make_heap(heap.begin(), heap.end(), cmp);
             }
-            std::make_heap(heap.begin(), heap.end(), cmp);
         }
     }
     void save(graphlab::oarchive& oarc) const {
-        oarc << (const std::vector<heap_type>&)(*this);
+        oarc << (const std::pair<std::vector<heap_type>,std::vector<heap_type> >&)(*this);
     }
     void load(graphlab::iarchive& iarc) {
-        iarc >> (std::vector<heap_type>&)(*this);
+        iarc >> (std::pair<std::vector<heap_type>,std::vector<heap_type> >&)(*this);
     }
     void sort() {
-        for (size_t i=0; i<size(); ++i) {
-            std::sort_heap(at(i).begin(), at(i).end(), cmp);
+        for (size_t heapidx=0; heapidx<2; ++heapidx) {
+            std::vector<heap_type>& me = heapidx ? second : first;
+            for (size_t i=0; i<me.size(); ++i) {
+                std::sort_heap(me[i].begin(), me[i].end(), cmp);
+            }
         }
     }
-    static void map(const graph_type::vertex_type& v, MergeableHeaps& heaps) {
-        if (v.id() >= (1u<<31)) {
-            return; // only deviationids
-        }
+    static void map(const graph_type::vertex_type& v, MergeableHeaps& heaps_pair) {
+        std::vector<heap_type>& heaps = (v.id() >= (1u<<31)) ? heaps_pair.second : heaps_pair.first;
         const size_t size = std::max(1ul, SEEDS.size());
         if (heaps.size() != size) {
             heaps.resize(size);
@@ -318,8 +290,8 @@ public:
     }
 };
 
-vertex_data_type pagerank_sum(const graph_type::vertex_type& v) { return v.data(); }
-double weight_sum(const graph_type::edge_type& e) { return (double)e.data(); }
+gather_vector_type pagerank_sum(const graph_type::vertex_type& v) { return v.data(); }
+gather_scalar_type weight_sum(const graph_type::edge_type& e) { return (gather_scalar_type)e.data(); }
 
 
 int main(int argc, char** argv) {
@@ -407,11 +379,8 @@ int main(int argc, char** argv) {
     }
     // must call finalize before querying the graph
     graph.finalize();
-    dc.cout() << "#vertices: " << graph.num_vertices()
-                    << " #edges:" << graph.num_edges() << std::endl;
-
     {
-        double edgewtsum = graph.map_reduce_edges<double>(weight_sum);
+        gather_scalar_type edgewtsum = graph.map_reduce_edges<gather_scalar_type>(weight_sum);
         dc.cout() << "Initial edge weight sum = " << edgewtsum/graph.num_vertices() << " * " << graph.num_vertices() << std::endl;
     }
 
@@ -443,7 +412,7 @@ int main(int argc, char** argv) {
     }
 
     {
-        double edgewtsum = graph.map_reduce_edges<double>(weight_sum);
+        gather_scalar_type edgewtsum = graph.map_reduce_edges<gather_scalar_type>(weight_sum);
         dc.cout() << "Final edge weight sum = " << edgewtsum/graph.num_vertices() << " * " << graph.num_vertices() << std::endl;
     }
 
@@ -462,7 +431,7 @@ int main(int argc, char** argv) {
         dc.cout() << "Finished initializing pageranks in " << runtime
                 << " seconds." << std::endl;
     }
-    N_VERTICES = graph.map_reduce_vertices<vertex_data_type>(pagerank_sum);
+    N_VERTICES = graph.map_reduce_vertices<gather_vector_type>(pagerank_sum);
     dc.cout() << "Initial pagerank sum = [";
     for (size_t i=0; i<N_VERTICES.size(); ++i) {
         dc.cout() << " " << N_VERTICES[i]/graph.num_vertices();
@@ -479,26 +448,32 @@ int main(int argc, char** argv) {
                 << " seconds." << std::endl;
     }
 
-    N_VERTICES = graph.map_reduce_vertices<vertex_data_type>(pagerank_sum);
+    N_VERTICES = graph.map_reduce_vertices<gather_vector_type>(pagerank_sum);
     dc.cout() << "Final pagerank sum = [";
     for (size_t i=0; i<N_VERTICES.size(); ++i) {
         dc.cout() << " " << N_VERTICES[i]/graph.num_vertices();
     }
     dc.cout() << " ] * " << graph.num_vertices() << std::endl;
 
-
     // get the top-ranking vertices for each personal seed
     if (TOP_K) {
         MergeableHeaps heaps = graph.fold_vertices<MergeableHeaps>(MergeableHeaps::map);
         heaps.sort();
-        for (size_t i=0; i<heaps.size(); ++i) {
+        dc.cout() << "Top Deviations" << std::endl;
+        for (size_t i=0; i<heaps.first.size(); ++i) {
             dc.cout() << "Seed " << i << std::endl;
-            for (size_t j=0; j<heaps[i].size(); ++j) {
-                dc.cout() << "\t:thumb" << heaps[i][j].first << ": " << heaps[i][j].second << std::endl;
+            for (size_t j=0; j<heaps.first[i].size(); ++j) {
+                dc.cout() << "\t:thumb" << heaps.first[i][j].first << ":\t" << heaps.first[i][j].second << std::endl;
+            }
+        }
+        dc.cout() << std::endl << "Top Collections" << std::endl;
+        for (size_t i=0; i<heaps.second.size(); ++i) {
+            dc.cout() << "Seed " << i << std::endl;
+            for (size_t j=0; j<heaps.second[i].size(); ++j) {
+                dc.cout() << "\tCollection " << (heaps.second[i][j].first & ((1u<<31)-1u)) << ":\t" << heaps.second[i][j].second << std::endl;
             }
         }
     }
-
 
     // Save the final graph -----------------------------------------------------
     if (saveprefix != "") {
